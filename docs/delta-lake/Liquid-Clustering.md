@@ -275,3 +275,301 @@ Delta Lake 4.0은 큰 릴리즈이며, (프리뷰 시점 기준) Apache Spark 4.
 [7]: https://delta.io/blog/delta-lake-4-0/ "Delta Lake 4.0 Preview | Delta Lake"
 [8]: https://delta.io/blog/2025-09-25-delta-lake-40/ "Delta Lake 4.0 | Delta Lake"
 
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+아래 내용은 **Delta Lake 3.3.x 기준**으로, *Liquid Clustering*과 특히 **`OPTIMIZE FULL`**이 “정확히 무엇을 더 하는지”, “어떤 메타데이터/구조를 남기는지”, “ZCube가 왜 등장하는지”를 **구조(트랜잭션 로그/파일 배치) 중심으로** 최대한 쉽게 풀어쓴 “보고서형” 설명입니다. (중간에 확인용으로 직접 `_delta_log`에서 볼 수 있는 흔적도 같이 넣었습니다.)
+
+---
+
+## 1) Liquid Clustering이 해결하려는 문제
+
+### 1.1 전통적 방식(Partition / ZORDER)의 한계
+
+* **Hive-style partition**: 디렉터리 레벨로 데이터를 나눠서 *partition pruning*을 극대화하지만
+
+  * 파티션 키를 잘못 잡으면 *과다 파티션(파일 폭증)* 또는 *과소 파티션(스캔 과다)*가 발생.
+  * 쿼리 패턴이 바뀌면 파티션 설계를 다시 하기가 매우 비쌈(대규모 rewrite/재적재).
+* **Z-Order (ZORDER BY)**: 파티션 내부(또는 비파티션 테이블)에서 다차원 locality를 개선하지만
+
+  * “그때그때 지정한 컬럼” 기준이라 운영 관점에서 **지속적/점진적 유지**가 어렵고,
+  * “전체를 다시 정렬”하는 느낌이라 비용이 커질 수 있음.
+
+### 1.2 Liquid Clustering의 핵심 아이디어
+
+Liquid Clustering은 **“파티션처럼 경직된 디렉터리 분할” 대신**, 테이블 내부 파일들을 **클러스터링 키(컬럼) 기준으로 점진적으로 재배치**해서,
+
+* 쿼리에서 클러스터링 컬럼으로 필터할 때 **파일 통계(min/max) 기반 data skipping**이 잘 먹도록 만들고,
+* 데이터/쿼리 패턴 변화에 맞춰 **키를 바꿔도(ALTER CLUSTER BY)** “새로 들어오는 데이터부터” 반영 가능하게 하며,
+* 필요하면 **`OPTIMIZE FULL`로 기존 데이터까지 한 번에 재클러스터링**합니다. ([Delta Lake][1])
+
+---
+
+## 2) Liquid Clustering을 “프로토콜/로그 관점”에서 보면
+
+Liquid Clustering은 “그냥 OPTIMIZE가 더 똑똑해진 것”이 아니라, **Delta 로그에 ‘이 테이블은 클러스터드 테이블이다’라는 표준화된 흔적을 남기도록** 설계돼 있습니다.
+
+### 2.1 Delta 프로토콜이 요구하는 2가지 흔적
+
+Delta 프로토콜(로그 스펙)에서 **클러스터드 테이블(Clustered Table)**은 Writer가 다음을 써야 한다고 명시합니다.
+
+1. **도메인 메타데이터(domainMetadata)에 클러스터링 컬럼을 기록**
+
+   * domain: `delta.clustering`
+2. 파일을 추가(add)할 때 **`clusteringProvider` 필드를 채워야 함** (이 파일이 어떤 클러스터링 구현으로 쓰였는지) ([GitHub][2])
+
+즉, Liquid Clustering을 켠 테이블은 `_delta_log`에 “클러스터링 키/공급자”가 **구조적으로 박힙니다.**
+
+---
+
+## 3) ZCube는 뭐고, 왜 나오나?
+
+### 3.1 ZCube를 한 문장으로
+
+**ZCube = “클러스터링(재정렬) 작업 단위로 생성된 파일 묶음(논리적 배치/세대)”**라고 이해하면 가장 안전합니다.
+
+Liquid Clustering은 “매번 전체를 갈아엎는” 대신, 보통은 **‘필요한 파일만’** 뽑아서 재작성(rewrite)하는데, 이때 **어떤 파일들이 같은 클러스터링 작업으로 생성됐는지**를 식별하고, 이후의 점진적 유지/재클러스터링 판단에 활용하기 위해 **ZCube ID 같은 태그를 남깁니다.**
+
+### 3.2 ZCube 흔적(태그)은 어디에 남나?
+
+일반적으로 “클러스터링된 파일”은 Delta 로그의 `add` 액션에 **tags**로 ZCube 관련 값을 남깁니다. 예: `ZCUBE_ID`, `ZCUBE_ZORDER_BY`, `ZCUBE_ZORDER_CURVE` 등
+
+> 주의: 위 태그 이름/형태는 구현/버전에 따라 조금씩 달라질 수 있지만, 핵심은 **“이 파일은 (어떤 키/어떤 커브/어떤 큐브 작업) 결과물이다”**를 로그에 남긴다는 점입니다.
+
+---
+
+## 4) `OPTIMIZE`가 Liquid Clustering에서 하는 일
+
+### 4.1 Liquid Clustering이 없는 테이블에서의 OPTIMIZE
+
+Delta 문서의 일반 OPTIMIZE는 기본적으로 “작은 파일을 큰 파일로 합치는(compaction/bin-packing)” 성격이 큽니다. ([Delta Lake][3])
+
+### 4.2 Liquid Clustering이 있는 테이블에서의 OPTIMIZE
+
+Databricks 문서에서도 요약이 잘 되어 있는데,
+
+* Liquid Clustering이 켜져 있으면 `OPTIMIZE`는 **클러스터링 키 기준으로 파일을 재작성**하여 데이터 레이아웃을 개선합니다.
+* 테이블이 파티션을 가지고 있으면, **파티션 내부에서** 이런 최적화가 수행됩니다. ([Databricks Docs][4])
+
+여기서 중요한 포인트는:
+
+> Liquid Clustering의 기본 `OPTIMIZE`는 보통 “점진적(incremental)”로 동작하며, **이미 충분히 잘 클러스터링된 영역/파일은 매번 전체 재작성하지 않는 방향**으로 설계된다는 점입니다.
+> (이 “점진성”을 구현하는 핵심 장치 중 하나가 **ZCube 계열 메타데이터**라고 보면 됩니다.)
+
+---
+
+## 5) Delta Lake 3.3의 `OPTIMIZE FULL`은 무엇이 다른가?
+
+### 5.1 공식 정의(3.3+)
+
+Delta Lake 문서(3.3+)는 `OPTIMIZE FULL`을 다음처럼 정의합니다.
+
+* **전체 테이블의 모든 레코드에 대해 강제로 reclustering 수행**
+* 특히 **클러스터링 컬럼을 바꾼 경우**, 기존 데이터는 자동으로 다시 쓰이지 않기 때문에 `OPTIMIZE FULL`을 권장
+* 이미 `OPTIMIZE FULL`을 수행했고 클러스터링 컬럼 변화가 없다면, `OPTIMIZE FULL`은 일반 `OPTIMIZE`와 동일하게 동작 ([Delta Lake][1])
+
+즉:
+
+* `OPTIMIZE`(기본): “대개 필요한 부분만 점진적으로”
+* `OPTIMIZE FULL`: “**(필요 시) 전체 데이터까지 포함해서** 현재 클러스터링 키에 맞도록 강제 재배치”
+
+### 5.2 왜 `OPTIMIZE FULL`이 필요한가?
+
+문서에 있는 핵심 문장이 이겁니다.
+
+* `ALTER TABLE ... CLUSTER BY (...)`로 **클러스터링 컬럼을 바꾸면**
+
+  * 이후에 들어오는 데이터와 이후 OPTIMIZE는 새 키를 쓰지만
+  * **기존 데이터는 자동 rewrite되지 않는다** ([Delta Lake][1])
+
+그래서 키 변경 직후에는 테이블 내부에
+
+* “옛 키로 클러스터링된 파일(=옛 ZCube들)”
+* “새 키로 쓰인 신규 파일”
+  이 섞이게 되고, 이 상태에선 새 키 필터의 data skipping 효과가 기대만큼 안 나올 수 있습니다.
+
+이때 `OPTIMIZE FULL`이 “한 번 전체를 현재 키에 맞게 재정렬”해 줍니다. ([Delta Lake][1])
+
+---
+
+## 6) `OPTIMIZE FULL` 동작을 “실행 단계”로 쪼개보기
+
+아래는 **구현을 과도하게 단정하지 않으면서**, 문서/프로토콜에서 보장되는 사실을 기반으로 *어떻게 굴러갈 수밖에 없는지*를 정리한 것입니다.
+
+### 6.1 입력: 현재 클러스터링 키를 어디서 읽나?
+
+* `_delta_log`의 **domainMetadata(domain=`delta.clustering`)**에 기록된 “현재 클러스터링 컬럼 목록”을 사용합니다. ([GitHub][2])
+
+### 6.2 파일 선정: `OPTIMIZE` vs `OPTIMIZE FULL`
+
+* `OPTIMIZE`는 보통 “점진적 유지” 관점에서 **일부 파일만** 대상으로 삼습니다(예: 새로 유입된 파일, 작은 파일, 품질이 낮은 파일 등).
+* `OPTIMIZE FULL`은 문서상 “**모든 레코드를 강제로 reclustering**”하는 모드이므로, **기존에 클러스터링되어 있던 데이터까지 포함**해 현재 키 기준으로 필요하면 재작성합니다. ([Delta Lake][1])
+
+> 문서에 “reclusters all existing data **as necessary**”라고 표현한 것은
+> 구현이 “이미 완전히 현재 키 기준으로 정렬된 영역은 굳이 또 안 만질 수도” 있음을 암시합니다.
+> 그리고 “클러스터링 컬럼 변화가 없으면 OPTIMIZE FULL이 OPTIMIZE처럼 동작”한다고 명시합니다. ([Delta Lake][1])
+
+### 6.3 재작성: 결과 파일을 어떻게 만들까?
+
+결과적으로는:
+
+* 선택된 입력 파일들을 읽고
+* 클러스터링 키 기준 locality를 높이는 방식으로 레코드를 재배치한 뒤
+* 적정 파일 크기(타겟 사이즈)에 맞춰 새 Parquet 파일들을 씁니다.
+
+그리고 새 파일의 `add` 액션에는
+
+* `clusteringProvider`가 세팅되고 ([GitHub][2])
+* ZCube 관련 태그(예: ZCUBE_ID 등)가 달릴 수 있습니다.
+
+### 6.4 커밋(로그 결과물): 어떤 구조가 남나?
+
+Delta는 ACID 로그 기반이므로, `OPTIMIZE FULL` 결과는 항상 다음 형태로 남습니다.
+
+* commitInfo(operation = OPTIMIZE …)
+* `remove` 액션들: 기존 파일 제거 표시
+* `add` 액션들: 새 파일 추가
+* 그리고 clustered table이라면 domainMetadata / clusteringProvider 규칙을 만족해야 함 ([GitHub][2])
+
+---
+
+## 7) “결과물 구조”를 `_delta_log`에서 직접 확인하는 법
+
+아래는 “어디를 보면 Liquid Clustering / OPTIMIZE FULL 흔적이 있나”를 보여주는 *관찰 포인트*입니다. (예시는 개념용)
+
+### 7.1 domainMetadata에서 클러스터링 키 확인
+
+Delta 프로토콜이 요구하는 부분입니다. ([GitHub][2])
+
+```json
+{
+  "domainMetadata": {
+    "domain": "delta.clustering",
+    "configuration": {
+      "clusteringColumns": ["colA", "colB"]
+    }
+  }
+}
+```
+
+### 7.2 add 액션에서 clusteringProvider / ZCube 태그 확인
+
+프로토콜의 `clusteringProvider` 요구사항 ([GitHub][2]) 과, ZCube 태그 예시  를 함께 보면 감이 잡힙니다.
+
+```json
+{
+  "add": {
+    "path": "part-00000-....snappy.parquet",
+    "size": 123456789,
+    "stats": "{...minValues/maxValues...}",
+    "clusteringProvider": "liquid", 
+    "tags": {
+      "ZCUBE_ID": "....",
+      "ZCUBE_ZORDER_BY": "colA,colB",
+      "ZCUBE_ZORDER_CURVE": "hilbert"
+    }
+  }
+}
+```
+
+> 여기서 **stats(min/max)**가 좋아질수록, colA/colB 필터 시 *data skipping*이 강해지는 구조입니다.
+> Liquid Clustering은 결국 “이 stats를 쿼리에 유리하게 만들도록 파일을 재배치”하는 메커니즘이라고 보면 됩니다.
+
+---
+
+## 8) Delta Lake 3.3에서 “강화된 Liquid Clustering” 포인트 요약
+
+Delta Lake 3.3의 릴리스/문서에서 Liquid Clustering 관련 하이라이트로 반복 등장하는 건 크게 두 가지입니다.
+
+1. **`OPTIMIZE FULL` 지원**: Liquid 테이블을 “완전 재클러스터링” ([delta.io][5])
+2. **기존(특히 unpartitioned) 테이블에 `ALTER TABLE ... CLUSTER BY (...)`로 Liquid Clustering 켜기** ([GitHub][6])
+
+---
+
+## 9) Delta Lake 4.x에서의 언급(무엇이 바뀌었나?)
+
+Delta Lake 4.0 프리뷰 릴리스 노트에서도 Liquid Clustering 업데이트로
+
+* `OPTIMIZE FULL` 지원,
+* 기존 테이블에 CLUSTER BY 적용
+  을 다시 강조합니다. ([GitHub][6])
+
+즉, **3.3에서 들어온 핵심 운영 기능(특히 OPTIMIZE FULL)이 4.x 계열에서도 중요한 축으로 유지**된다고 보면 됩니다.
+
+---
+
+## 10) 운영 관점에서 `OPTIMIZE` vs `OPTIMIZE FULL` 선택 가이드
+
+### 10.1 `OPTIMIZE`를 주로 쓰는 경우
+
+* 클러스터링 키가 안정적이고(바뀌지 않고)
+* 신규 데이터가 계속 들어오며
+* 점진적으로 레이아웃을 유지하면 충분한 경우
+
+### 10.2 `OPTIMIZE FULL`을 “명확히” 써야 하는 경우
+
+문서가 가장 강하게 말하는 경우는 이겁니다.
+
+* **클러스터링 컬럼을 변경한 직후**
+
+  * 기존 데이터는 자동으로 새 키로 재배치되지 않기 때문에,
+  * “현재 키 기준 레이아웃”을 보장하려면 `OPTIMIZE FULL`을 수행 ([Delta Lake][1])
+
+또한 대규모 테이블에서 `OPTIMIZE FULL`은 오래 걸 수 있다고 경고합니다. ([Delta Lake][1])
+
+---
+
+## 11) 당신 케이스에서 “개념이 안 잡힐 때”의 한 줄 요약(비유)
+
+* Liquid Clustering을 **“파티션 디렉터리를 만드는 대신, 파일 단위의 ‘정렬/군집화 품질’을 관리하는 시스템”**이라고 생각하세요.
+* ZCube는 **그 파일 군집화 작업의 배치(세대) ID** 같은 것.
+* `OPTIMIZE`는 **부분 수선**, `OPTIMIZE FULL`은 **키 변경 후 전체 재배치(필요 시)** 입니다.
+
+---
+
+원하면 다음을 바로 이어서 더 깊게 파고들 수 있어요(추가 질문 없이 제가 이어서 써도 됩니다):
+
+1. **Liquid Clustering에서 “클러스터링 품질”을 어떻게 판단할 수 있는지**(메트릭/로그 관찰 포인트)
+2. **클러스터링 키 선정 전략**(파티션 키/고카디널리티/조인키/시간 컬럼을 어떻게 다루는 게 안전한지)
+3. Spark/Trino 관점에서 **data skipping이 실제로 어떻게 체감 성능으로 이어지는지**(파일 min/max, predicate pushdown, split planning까지)
+
+원하시면, 지금 쓰고 있는 테이블 스키마(주요 쿼리의 where/join 조건 포함)를 예로 들어서 **“이 키가 왜 유리/불리한지”**까지 Liquid Clustering 관점으로 구체 평가해 드릴게요.
+
+[1]: https://docs.delta.io/delta-clustering/?utm_source=chatgpt.com "Use liquid clustering for Delta tables"
+[2]: https://raw.githubusercontent.com/delta-io/delta/master/PROTOCOL.md "raw.githubusercontent.com"
+[3]: https://docs.delta.io/optimizations-oss/?utm_source=chatgpt.com "Optimizations"
+[4]: https://docs.databricks.com/aws/en/delta/optimize?utm_source=chatgpt.com "Optimize data file layout | Databricks on AWS"
+[5]: https://delta.io/blog/delta-lake-3-3/?utm_source=chatgpt.com "Delta Lake 3.3"
+[6]: https://github.com/delta-io/delta/releases?utm_source=chatgpt.com "Releases · delta-io/delta"
