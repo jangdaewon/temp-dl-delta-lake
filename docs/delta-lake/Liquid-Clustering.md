@@ -1,1 +1,277 @@
+# 1) Liquid Clustering이 해결하려는 문제
+
+Delta 테이블 성능은 본질적으로 다음 2가지에 의해 좌우됩니다.
+
+1. **스캔해야 하는 파일 수** (Small file problem 포함)
+2. **조건절(predicate)에 의해 “읽지 않아도 되는 파일”을 얼마나 잘 건너뛰는지(= data skipping / file pruning)**
+
+Delta는 각 데이터 파일(보통 Parquet)의 **파일 단위 통계(min/max/nullCount/rowCount 등)** 를 메타데이터에 저장해두고, 쿼리 조건절로 “이 파일은 절대 결과가 나올 수 없다”를 판정하면 그 파일 자체를 스캔에서 제외합니다. 이게 *data skipping*의 핵심입니다. ([Delta Lake][1])
+
+그런데, 파일 안에 값이 “뒤섞여” 있으면(예: 같은 eqp_id가 파일 전체에 산재) 파일의 min/max 범위가 너무 넓어서 “건너뛸 파일”이 잘 안 생깁니다. 그래서 **“파일마다 특정 컬럼 값의 범위를 좁게 만들도록 데이터를 재배치”** 하는 기법이 필요합니다.
+
+---
+
+# 2) 전통적 방식: Partitioning과 Z-Order의 한계
+
+## 2.1 Hive-style Partitioning
+
+파티셔닝은 “디렉터리(폴더) 단위로 파일을 분리”합니다. 예: `date=2026-02-11/eqp_id=E01/...`
+조건절에 partition 컬럼이 있으면 폴더 자체를 통째로 제외할 수 있어 강력합니다.
+
+하지만 다음 문제가 있습니다(특히 고카디널리티/스큐/변화하는 데이터에 취약):
+
+* 파티션이 너무 많아져 메타데이터/파일 수 폭증
+* 스큐가 심하면 어떤 파티션은 파일이 너무 크고, 어떤 파티션은 너무 작아짐
+* 파티션 전략을 바꾸려면 **테이블을 사실상 재작성(대규모 rewrite)** 해야 함 ([Delta][2])
+
+## 2.2 Z-Order(OPTIMIZE ZORDER BY)
+
+Z-Order는 “다차원 값을 1차원으로 매핑해서 정렬한 뒤 파일로 쓰기”라는 점에서 Liquid와 비슷한 계열입니다. 하지만 Delta가 Liquid Clustering을 도입한 배경에는 Z-Order의 구조적 한계가 큽니다:
+
+* `OPTIMIZE ZORDER BY`는 (해당 범위에 대해) **늘 크게 다시 리클러스터링(rewrite)** 하는 성격이라 **write amplification**이 큼
+* 클러스터링 컬럼을 테이블에 “기억”시키지 못해 사용자가 매번 `ZORDER BY(...)`를 반복 지정해야 하고 실수 유발 ([Delta][2])
+
+Delta 공식 문서도 `OPTIMIZE ZORDER BY`는 “(특정 케이스에서) 반복 수행 시 효율이 떨어질 수 있고, compaction처럼 항상 안전한 ‘멱등(idempotent)’ 작업으로 보기 어렵다”고 명시합니다. ([Delta Lake][1])
+
+---
+
+# 3) Liquid Clustering의 정의 (한 줄)
+
+**Liquid Clustering = “클러스터링 컬럼을 테이블 메타데이터에 저장해두고, OPTIMIZE가 *증분(incremental)* 으로 필요한 파일만 골라 Hilbert Curve 기반으로 재배치하는 방식”** 입니다. ([Delta][2])
+
+핵심 키워드 3개만 먼저 잡으면 이해가 빨라집니다.
+
+1. **Clustering columns가 테이블에 저장됨** (매번 지정할 필요 없음) ([Delta][2])
+2. **Hilbert Curve** 기반 다차원 클러스터링 (Z-Order보다 data skipping 개선 목표) ([Delta][2])
+3. **ZCube**라는 “증분 클러스터링 단위”를 도입해서 **이미 잘 정리된 파일은 다시 안 건드리는** 쪽으로 설계 ([Delta][2])
+
+---
+
+# 4) “파일과 데이터가 어떤 구조로 배치되는가” — 물리 구조부터
+
+## 4.1 Delta 테이블의 디렉터리 구조(큰 그림)
+
+일반적인 Delta 테이블(파티션 없다고 가정)은 대략 이렇게 생깁니다.
+
+```
+/table_path/
+  part-00000-....snappy.parquet
+  part-00001-....snappy.parquet
+  ...
+  _delta_log/
+    00000000000000000000.json
+    00000000000000000001.json
+    ...
+    00000000000000000010.checkpoint.parquet
+    ...
+```
+
+* 루트에는 **데이터 파일(대개 Parquet)** 들이 있고
+* `_delta_log/`에 **트랜잭션 로그**가 있어 “현재 스냅샷에서 읽어야 할 파일 목록”이 결정됩니다.
+
+Liquid Clustering은 **데이터 파일의 “배치(어떤 값들이 어떤 파일에 몰리느냐)”를 OPTIMIZE로 바꿔치기** 하는 기능이고, 그 사실/단위 정보가 **Delta 로그 메타데이터에 기록**됩니다. ([Delta][2])
+
+## 4.2 data skipping 통계(“파일마다 min/max”)
+
+Delta는 파일 단위로 컬럼 통계를 수집해 data skipping에 사용합니다. 기본적으로 “앞쪽 N개 컬럼”만 통계를 수집하고(N 기본값이 32), 테이블 속성으로 조정할 수 있습니다. ([Delta Lake][1])
+
+* 기본: `delta.dataSkippingNumIndexedCols = 32`
+* 모든 컬럼: `delta.dataSkippingNumIndexedCols = -1` ([Delta Lake][3])
+
+**중요:** Liquid Clustering에서 선택한 클러스터링 컬럼은 “통계가 수집되는 컬럼”이어야 의미가 있습니다. (통계가 없으면 스킵을 못 하니까요.) ([Delta][4])
+
+---
+
+# 5) Liquid Clustering의 작동 원리 (Hilbert + ZCube)
+
+## 5.1 Hilbert Curve가 뭐고, 왜 쓰나?
+
+Liquid는 다차원(최대 4개 컬럼) 값을 **Hilbert curve라는 space-filling curve**로 1차원 값(정렬키)로 매핑합니다. 그 1차원 값으로 정렬하면 “다차원 공간에서 가까운 점들이 디스크에서도 가깝게” 배치되는 성질이 생깁니다. ([Delta][2])
+
+> 직관: `(A,B,C)` 3차원 좌표를 “한 줄로 쭉 펴서” 번호를 매기는데, 그 번호가 “공간상의 이웃 관계”를 꽤 잘 보존하도록 만드는 방식.
+
+그 다음 OPTIMIZE는 이 정렬 순서대로 레코드를 다시 써서 **각 파일이 클러스터링 컬럼 기준으로 ‘좁은 범위’를 가지도록** 만듭니다. 그러면 조건절이 들어왔을 때 “이 파일은 범위 밖이므로 스캔 제외”가 크게 늘어납니다. ([Delta][2])
+
+## 5.2 ZCube: Liquid Clustering을 ‘증분’으로 만드는 핵심 개념
+
+Delta Lake 3.1에서 Liquid를 소개할 때, **증분 클러스터링의 단위를 “ZCube”** 라고 부릅니다. 공식 설명은 이렇습니다:
+
+* **ZCube = 동일한 OPTIMIZE 실행으로 생성된, Hilbert-clustered 데이터 파일들의 “그룹”**
+* 이미 클러스터링된 파일은 **Delta 로그(파일 메타데이터)에 ZCube id로 태그**되고,
+* 이후 OPTIMIZE는 **태그가 없는(= 아직 클러스터링 안 된) 파일만 주로 다시 작성**해서 write amplification을 크게 줄입니다. ([Delta][2])
+
+여기서 “Cube”라는 이름 때문에 **“3D/4D 공간을 물리적으로 ‘정육면체’로 잘라 저장하나?”** 라고 오해하기 쉬운데, 정확히는:
+
+* *ZCube는 물리적인 폴더/파티션이 아닙니다.*
+* Delta 로그에서 “이 파일들은 **같은 클러스터링 작업의 산출물**이며, **같은 클러스터링 전략으로 정렬된 묶음**이다”를 추적하기 위한 **논리적 배치 단위**에 가깝습니다. ([Delta][2])
+
+### “파일 배치” 관점에서 ZCube를 어떻게 상상하면 좋나?
+
+아래처럼 생각하면 정확도가 높습니다.
+
+* 클러스터링 컬럼이 `(c1, c2, c3)`라면
+* 각 레코드는 Hilbert index `h(c1,c2,c3)`를 갖게 되고
+* OPTIMIZE는 `h`로 정렬한 다음 “타겟 파일 크기”에 맞춰 연속 구간을 잘라 파일로 씁니다.
+* 이때 **연속 구간(= 비슷한 h 범위)** 로 만들어진 파일 묶음이 곧 **한 ZCube**가 됩니다. ([Delta][2])
+
+즉, “ZCube 안의 파일들”은 **서로 비슷한 다차원 값들을 포함**하도록 만들어지고, 그 상태를 “이 ZCube에 속한 파일”로 로그에 표시해두는 것입니다.
+
+---
+
+# 6) OPTIMIZE가 Liquid Clustering에서 하는 일 (3.3.x 기준)
+
+## 6.1 OPTIMIZE의 기본 성격: compaction + (필요 시) 클러스터링
+
+Delta의 OPTIMIZE는 기본적으로 **작은 파일들을 큰 파일로 합치는(compaction)** 용도이며, 이는 small file problem을 줄이는 대표적 방법입니다. ([Delta Lake][1])
+
+* 기본 compaction은 “작은 파일 → 큰 파일”로 재작성 (bin-packing) ([Delta Lake][1])
+* 일반적으로 OPTIMIZE는 **동시 읽기/쓰기와 공존**할 수 있게 트랜잭션 로그 기반으로 동작합니다(커밋 시점에 원자적으로 파일 교체). ([Delta Lake][1])
+
+Liquid Clustering 테이블에서는, OPTIMIZE가 compaction을 하면서 **클러스터링 컬럼 기준으로(테이블에 저장된 정보 기반으로) Hilbert 정렬을 적용**하는 방향으로 작동합니다. ([Delta][2])
+
+## 6.2 “증분”이라는 말의 정확한 의미
+
+Delta docs는 Liquid clustering을 이렇게 규정합니다:
+
+* Liquid clustering은 **incremental**이다.
+* “데이터가 계속 들어오는 동안에도” 최적화를 수행할 수 있다.
+* **다른 클러스터링 컬럼으로 이미 클러스터링된 파일은 자동으로 다시 쓰지 않는다** (즉, 키를 바꾸면 과거 데이터는 그대로 남을 수 있음). ([Delta Lake][5])
+
+여기서 ZCube 태그가 중요한 역할을 합니다. “이미 Hilbert-clustered 결과물”을 표시해두면 다음 OPTIMIZE가 “어디부터 다시 손대야 하는지”를 빠르게 결정할 수 있으니까요. ([Delta][2])
+
+---
+
+# 7) OPTIMIZE FULL이 왜 중요한가 (3.3의 핵심 변화)
+
+Delta Lake 3.3 릴리즈 하이라이트에 Liquid clustering 관련으로 딱 3개가 들어갑니다:
+
+* **OPTIMIZE FULL**
+* 기존 **unpartitioned 테이블**에 clustering enable
+* **external location**에서 clustered table 생성 ([Delta][6])
+
+즉, 3.3에서 Liquid Clustering을 “운영 가능한 기능”으로 만드는 실질적 완성도가 올라갔다고 보면 됩니다.
+
+## 7.1 OPTIMIZE FULL의 의미: “전체 리클러스터링”
+
+Liquid clustering의 일반 OPTIMIZE는 기본적으로 “필요한 것만” 증분으로 고칩니다.
+그런데 아래 상황에서는 “전체를 다시 정렬”하고 싶은 니즈가 생깁니다.
+
+* Liquid Clustering을 **처음 도입했는데**, 테이블에 이미 과거 데이터 파일이 잔뜩 존재
+* `CLUSTER BY` 컬럼을 **변경**했는데, 기존 파일들은 옛 키 기준(또는 무질서)로 남아 있음
+* 과거에 데이터가 크게 어지럽혀졌고(예: 대규모 MERGE/UPDATE/streaming small files), “전체를 다시 잡고” 싶음
+
+이걸 위해 3.3에서 들어온 게 `OPTIMIZE ... FULL` 입니다. 문서상 예시는 다음과 같습니다. ([Delta Lake][5])
+
+```sql
+OPTIMIZE table_name FULL;
+```
+
+**직관적으로는** “증분 최적화”가 아니라 **테이블 전체 파일을 대상으로 Hilbert 클러스터링 재배치(= 전면 리빌드)** 를 수행한다고 보면 됩니다. ([Delta Lake][5])
+
+## 7.2 FULL을 해야만 ‘완전히’ 좋아지는 대표 케이스
+
+Liquid clustering의 문서가 말하는 중요한 포인트가 이것입니다:
+
+> “클러스터링 컬럼이 다른 상태로 이미 클러스터링된 파일은 자동으로 다시 쓰지 않는다.” ([Delta Lake][5])
+
+즉, `ALTER TABLE ... CLUSTER BY (new_cols...)`로 키를 바꿨을 때:
+
+* **새로 들어오는 데이터 + 새 OPTIMIZE 결과물**은 *new_cols* 기준으로 ZCube가 만들어지지만
+* **기존 데이터 파일들은 old_cols(또는 무정렬)** 상태로 남아 “혼재”할 수 있습니다.
+
+이 혼재 상태는 “시간이 지나면 자연히 치유”되기도 하지만(새 데이터가 많고 자주 OPTIMIZE하면 점진적으로 new layout 비중 증가),
+**깔끔하게 한 번에 정리하려면 FULL이 필요**합니다. ([Delta Lake][5])
+
+---
+
+# 8) Liquid Clustering을 쓰는 테이블의 제약/요건 (3.3.x)
+
+## 8.1 테이블 프로토콜/기능 플래그
+
+Delta 문서는 Liquid clustering 테이블이 다음을 요구한다고 명시합니다:
+
+* **Table features: `Clustering` + `DomainMetadata`**
+* 최소 **Reader Version 1, Writer Version 7**
+* 이 기능들을 지원하지 않는 writer는 테이블에 쓰기 불가(프로토콜 상) ([Delta Lake][5])
+
+이건 운영에서 중요합니다. “클러스터링을 켠 순간” 모든 writer/엔진이 그 테이블 기능을 이해해야 합니다.
+
+## 8.2 컬럼 제한: 최대 4개, 그리고 “통계 수집되는 컬럼”이어야 함
+
+Liquid clustering 블로그/문서가 직접 못 박는 제약은:
+
+* 클러스터링 컬럼은 **최대 4개**
+* 클러스터링 컬럼은 **Delta 로그에 통계가 수집되는 컬럼**이어야 함
+* 기본 통계 수집은 “처음 32 컬럼”이며 `delta.dataSkippingNumIndexedCols`로 조정 가능 ([Delta][4])
+
+> 실무 팁: “쿼리에서 가장 자주 필터/조인에 쓰는 컬럼”이 **스키마 앞쪽 32개 밖**에 있으면, Liquid를 켰는데도 data skipping이 기대만큼 안 나올 수 있습니다. 이때는 (1) 스키마 컬럼 순서 조정, (2) `delta.dataSkippingNumIndexedCols` 상향/`-1`, 같은 접근을 검토합니다. ([Delta Lake][1])
+
+---
+
+# 9) (매우 실무적인) “내 테이블에서 파일이 어떻게 바뀌는가” 시나리오
+
+당신이 Liquid Clustering을 이미 쓰고 있다고 했으니, 체감이 가장 큰 대표 흐름을 하나로 묶어 설명해볼게요.
+
+## 9.1 초기 상태: 스트리밍/빈번한 배치로 small files + 값 뒤섞임
+
+* ingestion이 계속 append → 작은 파일이 많이 생김
+* 각 파일에는 eqp/param/time 값이 뒤섞여 있음
+* 결과: 파일 min/max 범위가 넓어 data skipping 약함 ([Delta Lake][1])
+
+## 9.2 OPTIMIZE(일반) 실행: “새/어지러운 구간만” 재정렬 + ZCube 생성
+
+OPTIMIZE는 대략 이런 변화를 만들었다고 이해하면 됩니다.
+
+* (A) 작은 파일들을 읽어들여
+* (B) 클러스터링 컬럼 기반 Hilbert index를 계산한 뒤 정렬하고
+* (C) 타겟 파일 크기에 맞춰 큰 파일로 다시 씀(= compaction)
+* (D) 커밋 시점에 “옛 파일 제거 + 새 파일 추가”
+* (E) 그리고 이 새 파일 묶음을 “ZCube id”로 로그에 태깅 ([Delta][2])
+
+이후 쿼리가 `(eqp_id = 'E01' AND created_time between ... )` 같은 조건을 쓰면,
+파일 단위 min/max가 더 촘촘해져 “읽을 파일 수”가 줄 가능성이 커집니다. ([Delta Lake][1])
+
+## 9.3 OPTIMIZE FULL 실행: “테이블 전체를 한 번에 새 레이아웃으로”
+
+FULL은 위 작업을 “부분”이 아니라 “전체”에 대해 수행해서,
+
+* 과거 데이터까지 포함해 한 번에 “현재 CLUSTER BY 키” 기준으로 정렬 상태를 맞추는 효과가 있습니다. ([Delta Lake][5])
+
+---
+
+# 10) 4.x에서는 뭐가 달라졌나? (Liquid 관점 중심)
+
+Delta Lake 4.0은 큰 릴리즈이며, (프리뷰 시점 기준) Apache Spark 4.0 프리뷰 기반에서 **Delta Connect, Coordinated Commits, Variant, Type Widening** 등 폭이 넓은 기능들을 강조합니다. ([Delta][7])
+또한 4.x 라인업은 4.0/4.1 등으로 릴리즈가 이어졌습니다. ([Delta][8])
+
+다만 **Liquid Clustering 자체의 “핵심 개념(= Hilbert + ZCube + 증분 OPTIMIZE, 그리고 FULL로 전체 재정렬)”은 3.3에서 이미 ‘운영 완성형’으로 크게 정리된 뒤** 4.x 릴리즈 포스트에서는 Liquid만을 크게 바꾸는 내용이 전면에 나오진 않습니다. (즉, 4.x에서 *Liquid의 철학이 바뀌었다*고 말할 근거는 공개 릴리즈 하이라이트만으로는 제한적입니다.) ([Delta][6])
+
+---
+
+# 11) 체크리스트: “나는 Liquid를 쓰는데 개념을 몰랐다”에 딱 맞는 점검 포인트
+
+1. **CLUSTER BY 컬럼이 쿼리 predicate에 진짜 자주 등장하는가?**
+2. 그 컬럼들이 **통계 수집 대상**인가? (`delta.dataSkippingNumIndexedCols`) ([Delta Lake][3])
+3. 테이블에 과거 데이터가 많다면, “일반 OPTIMIZE만으로 충분했나, FULL을 한 번 해야 하나?” ([Delta Lake][5])
+4. 쓰기 엔진이 여러 개라면(예: Trino + Spark 혼용), **클러스터링 테이블 기능(Clustering/DomainMetadata)을 writer들이 모두 이해하는가?** ([Delta Lake][5])
+
+---
+
+## 다음 단계(원하면)
+
+원하시면, 당신의 실제 워크로드를 기준으로:
+
+* (A) **CLUSTER BY 후보 컬럼 조합(최대 4개)** 을 어떻게 고르는 게 합리적인지
+* (B) “언제 OPTIMIZE, 언제 OPTIMIZE FULL”을 돌릴지(빈도/조건)
+* (C) `delta.dataSkippingNumIndexedCols`를 올릴 때의 비용/부작용(로그 크기/통계 수집 비용)
+  을 **현재 테이블 스키마/쿼리 패턴** 기준으로 더 구체화해서 “운영 가이드” 형태로 정리해드릴게요.
+
+[1]: https://docs.delta.io/optimizations-oss/ "Optimizations | Delta Lake"
+[2]: https://delta.io/blog/delta-lake-3-1/ "Delta Lake 3.1.0 | Delta Lake"
+[3]: https://docs.delta.io/table-properties/?utm_source=chatgpt.com "Delta Table Properties Reference"
+[4]: https://delta.io/blog/liquid-clustering/?utm_source=chatgpt.com "Delta Lake Liquid Clustering"
+[5]: https://docs.delta.io/delta-clustering/ "Use liquid clustering for Delta tables | Delta Lake"
+[6]: https://delta.io/blog/delta-lake-3-3/ "Delta Lake 3.3 | Delta Lake"
+[7]: https://delta.io/blog/delta-lake-4-0/ "Delta Lake 4.0 Preview | Delta Lake"
+[8]: https://delta.io/blog/2025-09-25-delta-lake-40/ "Delta Lake 4.0 | Delta Lake"
 
